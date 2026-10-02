@@ -198,6 +198,11 @@ def test_cpu_card_percent_zero_delta_returns_zeroes():
         ]
         assert card._get_cpu_percent() == (0.0, 0.0)
 
+def test_cpu_card_voltage_na_when_unavailable():
+    card = pi_monitor.CpuCard()
+    with patch("pi_monitor.run", return_value="N/A"):
+        assert card._get_voltage() == "N/A"
+
 
 # ── TemperatureCard — collect and throttle ────────────────────────────────────
 
@@ -718,6 +723,9 @@ def test_build_html_cpu_iowait_row():
     h = _html()
     assert "I/O wait" in h
     assert "3.2%" in h
+
+def test_build_html_cpu_voltage_row_always_present():
+    assert "Core voltage" in _html()
 
 def test_build_html_ethernet_ip():
     assert "192.168.1.100" in _html()

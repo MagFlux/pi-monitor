@@ -212,12 +212,11 @@ class CpuCard(Card):
         raw = run("vcgencmd measure_volts core 2>/dev/null")
         if "=" in raw:
             return raw.split("=")[1]
-        return None
+        return "N/A"
 
     def render(self):
         h = html.escape
         la1, la5, la15 = self.load
-        volt_html = f'<span class="k">Core voltage</span><span class="v">{h(self.voltage)}</span>' if self.voltage else ""
         return f"""
     <div class="card">
         <div class="card-title">CPU Usage</div>
@@ -225,9 +224,9 @@ class CpuCard(Card):
         <div class="sub">Load avg &nbsp; {h(la1)} &nbsp; {h(la5)} &nbsp; {h(la15)} &nbsp; (1 / 5 / 15 min)</div>
         {bar(self.cpu_pct, pct_color(self.cpu_pct))}
         <div style="margin-top:12px" class="kv-grid">
-        <span class="k">Frequency</span><span class="v">{h(self.cpu_freq)}</span>
         <span class="k">I/O wait</span><span class="v">{self.iowait_pct}%</span>
-        {volt_html}
+        <span class="k">Frequency</span><span class="v">{h(self.cpu_freq)}</span>
+        <span class="k">Core voltage</span><span class="v">{h(self.voltage)}</span>
         </div>
     </div>"""
 
