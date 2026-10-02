@@ -143,15 +143,16 @@ def test_memory_card_swap_no_swap():
 
 def test_cpu_card_collect_sets_attributes():
     card = pi_monitor.CpuCard()
-    with patch.object(card, "_get_cpu_percent", return_value=42.5), \
+    with patch.object(card, "_get_cpu_percent", return_value=(42.5, 3.2)), \
          patch.object(card, "_get_load_avg",    return_value=("0.5", "0.6", "0.7")), \
          patch.object(card, "_get_cpu_freq",    return_value="1500 MHz"), \
          patch.object(card, "_get_voltage",     return_value="1.2V"):
         card.collect()
-    assert card.cpu_pct  == 42.5
-    assert card.load     == ("0.5", "0.6", "0.7")
-    assert card.cpu_freq == "1500 MHz"
-    assert card.voltage  == "1.2V"
+    assert card.cpu_pct    == 42.5
+    assert card.iowait_pct == 3.2
+    assert card.load       == ("0.5", "0.6", "0.7")
+    assert card.cpu_freq   == "1500 MHz"
+    assert card.voltage    == "1.2V"
 
 def test_cpu_card_load_avg():
     card = pi_monitor.CpuCard()
@@ -160,6 +161,42 @@ def test_cpu_card_load_avg():
     assert la1 == "0.50"
     assert la5 == "0.75"
     assert la15 == "1.00"
+
+def test_cpu_card_percent_counts_iowait_as_not_busy():
+    # /proc/stat line: user nice system idle iowait irq softirq steal guest guest_nice
+    # over the 500-tick window: 200 busy, 300 idle+iowait → 40% busy, 20% iowait.
+    card = pi_monitor.CpuCard()
+    with patch("pi_monitor.time.sleep"), \
+         patch("pi_monitor.Path") as path:
+        path.return_value.read_text.side_effect = [
+            "cpu  1000 0 500 4000 0   100 0 0 0 0\n",
+            "cpu  1200 0 500 4200 100 100 0 0 0 0\n",
+        ]
+        busy, iowait = card._get_cpu_percent()
+    assert busy   == 40.0
+    assert iowait == 20.0
+
+def test_cpu_card_percent_stat_without_iowait_field():
+    card = pi_monitor.CpuCard()
+    with patch("pi_monitor.time.sleep"), \
+         patch("pi_monitor.Path") as path:
+        path.return_value.read_text.side_effect = [
+            "cpu  1000 0 500 4000\n",
+            "cpu  1200 0 500 4000\n",
+        ]
+        busy, iowait = card._get_cpu_percent()
+    assert busy   == 100.0
+    assert iowait == 0.0
+
+def test_cpu_card_percent_zero_delta_returns_zeroes():
+    card = pi_monitor.CpuCard()
+    with patch("pi_monitor.time.sleep"), \
+         patch("pi_monitor.Path") as path:
+        path.return_value.read_text.side_effect = [
+            "cpu  1000 0 500 4000 0 0 0 0 0 0\n",
+            "cpu  1000 0 500 4000 0 0 0 0 0 0\n",
+        ]
+        assert card._get_cpu_percent() == (0.0, 0.0)
 
 
 # ── TemperatureCard — collect and throttle ────────────────────────────────────
@@ -588,10 +625,11 @@ def test_serve_handler_confined_to_known_paths():
 
 def _make_cards():
     cpu = pi_monitor.CpuCard()
-    cpu.cpu_pct  = 42.5
-    cpu.load     = ("0.50", "0.60", "0.70")
-    cpu.cpu_freq = "1500 MHz"
-    cpu.voltage  = "1.2000V"
+    cpu.cpu_pct    = 42.5
+    cpu.iowait_pct = 3.2
+    cpu.load       = ("0.50", "0.60", "0.70")
+    cpu.cpu_freq   = "1500 MHz"
+    cpu.voltage    = "1.2000V"
 
     temp = pi_monitor.TemperatureCard()
     temp.temperature    = 45.0
@@ -675,6 +713,11 @@ def test_build_html_section_titles():
 
 def test_build_html_cpu_percentage():
     assert "42.5%" in _html()
+
+def test_build_html_cpu_iowait_row():
+    h = _html()
+    assert "I/O wait" in h
+    assert "3.2%" in h
 
 def test_build_html_ethernet_ip():
     assert "192.168.1.100" in _html()

@@ -164,25 +164,35 @@ class Card:
 
 class CpuCard(Card):
     def collect(self):
-        self.cpu_pct  = self._get_cpu_percent()
+        self.cpu_pct, self.iowait_pct = self._get_cpu_percent()
         self.load     = self._get_load_avg()
         self.cpu_freq = self._get_cpu_freq()
         self.voltage  = self._get_voltage()
 
     def _get_cpu_percent(self):
+        """Return (busy_pct, iowait_pct) sampled from /proc/stat.
+
+        busy_pct follows top(1): iowait is NOT counted as busy CPU time, so
+        I/O stalls don't inflate the headline number. iowait_pct is the share
+        of the window spent waiting on I/O and is shown separately in the card.
+        """
         def read_stat():
             line  = Path("/proc/stat").read_text().splitlines()[0].split()
-            total = sum(int(x) for x in line[1:])
-            idle  = int(line[4])
-            return total, idle
-        t1, i1 = read_stat()
+            total  = sum(int(x) for x in line[1:])
+            iowait = int(line[5]) if len(line) > 5 else 0  # field absent on very old kernels
+            idle   = int(line[4]) + iowait                 # both count as not-busy
+            return total, idle, iowait
+        t1, i1, w1 = read_stat()
         time.sleep(0.5)
-        t2, i2 = read_stat()
+        t2, i2, w2 = read_stat()
         diff_total = t2 - t1
-        diff_idle  = i2 - i1
         if diff_total == 0:
-            return 0.0
-        return round(100.0 * (1 - diff_idle / diff_total), 1)
+            return 0.0, 0.0
+        diff_idle   = i2 - i1
+        diff_iowait = w2 - w1
+        busy   = round(100.0 * (1 - diff_idle / diff_total), 1)
+        iowait = round(100.0 * diff_iowait / diff_total, 1)
+        return busy, iowait
 
     def _get_load_avg(self):
         raw   = read("/proc/loadavg", "? ? ?")
@@ -216,6 +226,7 @@ class CpuCard(Card):
         {bar(self.cpu_pct, pct_color(self.cpu_pct))}
         <div style="margin-top:12px" class="kv-grid">
         <span class="k">Frequency</span><span class="v">{h(self.cpu_freq)}</span>
+        <span class="k">I/O wait</span><span class="v">{self.iowait_pct}%</span>
         {volt_html}
         </div>
     </div>"""

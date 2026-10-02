@@ -102,7 +102,7 @@ The generated page auto-refreshes every 5 minutes to match. If you use a differe
 ### Core
 
 - **System info** — hostname, uptime, OS, kernel, architecture
-- **CPU** — usage %, load average (1/5/15 min), frequency, core voltage
+- **CPU** — usage % (top-style; iowait excluded from it and shown separately), load average (1/5/15 min), frequency, core voltage
 - **Temperature** — SoC temperature with throttle status and active throttle flags
 - **Memory** — used/available RAM and swap
 - **Connectivity** — public IP, ping RTT and packet loss to `--ping-host` (default `8.8.8.8`)
