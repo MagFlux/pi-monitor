@@ -1213,9 +1213,14 @@ def _collect_and_render(make_cards, refresh_secs, store=None, output_path=None):
     cards = make_cards()
 
     with ThreadPoolExecutor(max_workers=max(1, len(cards)), thread_name_prefix="pi-monitor-collect") as pool:
-        futures = [pool.submit(c.collect) for c in cards.values()]
+        futures = [pool.submit(c.collect) for name, c in cards.items() if name != "cpu"]
         for f in futures:
             f.result()  # re-raises any collection error after all are done
+        if "cpu" in cards:
+            # Sample the CPU last: CpuCard's 0.5 s /proc/stat window must not
+            # include the probe burst above (ping, df, ps, vcgencmd...), or the
+            # dashboard reports its own collection work as CPU usage.
+            pool.submit(cards["cpu"].collect).result()
 
     hostname            = get_hostname()
     date_str, time_str  = get_datetime()

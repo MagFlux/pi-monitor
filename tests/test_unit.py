@@ -500,6 +500,33 @@ def test_refresh_loop_passes_mirror_path_when_configured(tmp_path):
     assert seen and all(p == output for p in seen)
 
 
+# ── _collect_and_render ───────────────────────────────────────────────────────
+
+def test_collect_and_render_runs_cpu_card_last():
+    calls = []
+
+    class DummyCard:
+        def __init__(self, name):
+            self.name = name
+        def collect(self):
+            calls.append(self.name)
+        def render(self):
+            return ""
+
+    def fake_make_cards():
+        return {"cpu": DummyCard("cpu"), "memory": DummyCard("memory"), "disks": DummyCard("disks")}
+
+    with patch.object(pi_monitor, "get_hostname", return_value="test-pi"), \
+         patch.object(pi_monitor, "get_datetime", return_value=("Monday", "12:00:00")), \
+         patch.object(pi_monitor, "get_uptime",   return_value="2h"), \
+         patch.object(pi_monitor, "get_os_info",  return_value=("Raspberry Pi OS", "6.1.21", "aarch64")), \
+         patch.object(pi_monitor, "build_html",   return_value="page"):
+        pi_monitor._collect_and_render(fake_make_cards, 300)
+
+    assert calls[-1] == "cpu"  # sampled on a quiet box, after the probe burst
+    assert set(calls[:-1]) == {"memory", "disks"}
+
+
 # ── serve handler ─────────────────────────────────────────────────────────────
 
 def _start_handler(store, filename="pi_monitor.html"):

@@ -117,8 +117,10 @@ explicit, safest encoding of a significant change.
 ## Architecture (all in pi_monitor.py, ~1500 lines)
 
 Data flow: `make_cards()` builds card objects → cards `.collect()` (parallel,
-ThreadPoolExecutor) → `build_html()` renders → output goes to disk (one-shot)
-or a `PageStore` (serve).
+ThreadPoolExecutor — non-CPU cards first, CpuCard last, so its 0.5 s
+`/proc/stat` window samples a quiet box rather than the dashboard's own probe
+burst) → `build_html()` renders → output goes to disk (one-shot) or a
+`PageStore` (serve).
 
 - **Card classes** (`CpuCard`, `TemperatureCard`, `MemoryCard`, `ConnectivityCard`,
   `WifiCard`, `EthernetCard`, `TailscaleCard`, `DockerCard`, `DiskCard`,
