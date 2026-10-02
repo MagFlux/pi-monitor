@@ -1,5 +1,6 @@
 """Unit tests for pi_monitor.py — pure functions and mocked card data-collection."""
 import pathlib
+import time
 from unittest.mock import patch
 
 import pi_monitor
@@ -288,6 +289,299 @@ def test_ports_card_handles_ipv6():
     files = {**_PROC_FILES, "/proc/net/tcp6": tcp6}
     ports = _ports_card_collected(files).ports
     assert any(p["proto"] == "tcp" and p["port"] == "80" for p in ports)
+
+
+# ── _fmt_interval ─────────────────────────────────────────────────────────────
+
+def test_fmt_interval_seconds():
+    assert pi_monitor._fmt_interval(1) == "1s"
+    assert pi_monitor._fmt_interval(45) == "45s"
+    assert pi_monitor._fmt_interval(59) == "59s"
+
+def test_fmt_interval_minutes():
+    assert pi_monitor._fmt_interval(60) == "1 min"
+    assert pi_monitor._fmt_interval(300) == "5 min"
+    assert pi_monitor._fmt_interval(3540) == "59 min"
+
+def test_fmt_interval_fractional_minutes():
+    assert pi_monitor._fmt_interval(90) == "1.5 min"
+
+def test_fmt_interval_hours():
+    assert pi_monitor._fmt_interval(3600) == "1 hr"
+    assert pi_monitor._fmt_interval(7200) == "2 hr"
+    assert pi_monitor._fmt_interval(5400) == "1.5 hr"
+
+
+# ── build_html — refresh marker ───────────────────────────────────────────────
+
+def test_build_html_default_refresh_is_300():
+    assert '<meta http-equiv="refresh" content="300">' in _html()
+
+def test_build_html_refresh_matches_interval():
+    h = pi_monitor.build_html(_make_cards(), refresh_secs=60, **_PAGE_KWARGS)
+    assert '<meta http-equiv="refresh" content="60">' in h
+    assert "updates in place every 1 min" in h
+    assert 'id="live"' in h
+    assert "<noscript>" in h
+    # the meta refresh lives inside <noscript> so it only applies without JS
+    meta_pos  = h.index('<meta http-equiv="refresh"')
+    assert h.index("<noscript>") < meta_pos < h.index("</noscript>")
+
+def test_build_html_refresh_clamps_low():
+    h = pi_monitor.build_html(_make_cards(), refresh_secs=0, **_PAGE_KWARGS)
+    assert '<meta http-equiv="refresh" content="1">' in h
+
+def test_build_html_live_region_and_header_hooks():
+    h = _html()
+    assert 'id="live"' in h
+    assert 'id="sysline"' in h          # uptime line is updatable without a full swap
+
+def test_build_html_structure_is_well_formed():
+    """Layout bugs (e.g. a stray unclosed header nesting the grids) must fail here."""
+    h = _html()
+    assert h.count("<header") == 1
+    assert h.count("</header>") == 1
+    assert h.count("<body>") == 1 and h.count("</body>") == 1
+    assert h.index("</header>") < h.index('<div id="live">') < h.index("<script>")
+    # all three card grids live inside #live, not inside the header
+    live_block = h[h.index('<div id="live">'):h.index("<script>")]
+    for marker in ('class="grid"', 'class="grid-wide"', 'class="footer"'):
+        assert marker in live_block
+    assert "<header" not in live_block
+
+    # and the tag soup parses to a balanced tree (void elements self-close)
+    from html.parser import HTMLParser
+    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input",
+            "link", "meta", "param", "source", "track", "wbr"}
+    stack = []
+    class Check(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            if tag not in VOID:
+                stack.append(tag)
+        def handle_endtag(self, tag):
+            assert stack and stack[-1] == tag, f"tag mismatch: closing </{tag}> but stack is {stack[-3:]}"
+            stack.pop()
+    Check().feed(h)
+    assert stack == [], f"unclosed tags remain: {stack}"
+
+def test_build_html_footer_is_static():
+    # The footer lives inside the swapped region; a per-cycle timestamp there
+    # would force a full dashboard DOM rebuild every cycle (and scrollbar churn).
+    h = _html()
+    footer = h[h.index('class="footer"'):]
+    footer = footer[:footer.index("</div>")]
+    assert "12:00:00" not in footer
+
+def test_css_reserves_scrollbar_gutter():
+    css = pi_monitor._css()
+    assert "scrollbar-gutter: stable" in css
+    assert "minmax(min(100%, 300px), 1fr)" in css  # columns stay fluid on narrow windows
+
+def test_js_ticks_header_without_rebuild():
+    js = pi_monitor._js(300)
+    assert ".datetime .time" in js
+    assert "getElementById('sysline')" in js
+    assert "__REFRESH_SECS__" not in js  # placeholder always substituted
+
+
+# ── _refresh_loop ─────────────────────────────────────────────────────────────
+
+def test_refresh_loop_regenerates_repeatedly(tmp_path):
+    import threading
+    store = pi_monitor.PageStore()
+    calls = []
+
+    with patch.object(pi_monitor, "_collect_and_render",
+                      side_effect=lambda make, secs, store=None, output_path=None: calls.append((store, secs))):
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=pi_monitor._refresh_loop,
+            args=(stop, 0.05, lambda: {}, store, 300),
+            daemon=True,
+        )
+        thread.start()
+        time.sleep(0.4)
+        stop.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert len(calls) >= 2
+    assert all(call[0] is store for call in calls)
+    assert all(call[1] == 300 for call in calls)
+
+def test_refresh_loop_survives_errors(tmp_path):
+    import threading
+    store = pi_monitor.PageStore()
+    calls = []
+
+    def boom(make, secs, store=None, output_path=None):
+        calls.append(store)
+        if len(calls) == 1:
+            raise RuntimeError("transient failure")
+
+    with patch.object(pi_monitor, "_collect_and_render", side_effect=boom):
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=pi_monitor._refresh_loop,
+            args=(stop, 0.05, lambda: {}, store, 300),
+            daemon=True,
+        )
+        thread.start()
+        time.sleep(0.4)
+        stop.set()
+        thread.join(timeout=5)
+
+    # loop kept going after the failure and stopped when asked
+    assert not thread.is_alive()
+    assert len(calls) >= 2
+
+def test_refresh_loop_passes_mirror_path_when_configured(tmp_path):
+    import threading
+    store = pi_monitor.PageStore()
+    output = tmp_path / "mirror.html"
+    seen = []
+
+    with patch.object(pi_monitor, "_collect_and_render",
+                      side_effect=lambda make, secs, store=None, output_path=None: seen.append(output_path)):
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=pi_monitor._refresh_loop,
+            args=(stop, 0.05, lambda: {}, store, 300),
+            kwargs={"output_path": output},
+            daemon=True,
+        )
+        thread.start()
+        time.sleep(0.3)
+        stop.set()
+        thread.join(timeout=5)
+
+    assert seen and all(p == output for p in seen)
+
+
+# ── serve handler ─────────────────────────────────────────────────────────────
+
+def _start_handler(store, filename="pi_monitor.html"):
+    """Start an in-process ThreadingHTTPServer on an ephemeral port; return (server, thread, base_url)."""
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), pi_monitor._make_handler_class(store, filename))
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    return httpd, thread, f"http://127.0.0.1:{httpd.server_address[1]}"
+
+def _stop_handler(httpd, thread):
+    httpd.shutdown()
+    httpd.server_close()
+    thread.join(timeout=5)
+
+def test_serve_handler_serves_full_path():
+    import urllib.request
+    store = pi_monitor.PageStore()
+    store.replace("<html>monitor</html>")
+    httpd, thread, base = _start_handler(store)
+    try:
+        with urllib.request.urlopen(f"{base}/pi_monitor.html", timeout=5) as resp:
+            body = resp.read().decode()
+    finally:
+        _stop_handler(httpd, thread)
+    assert body == "<html>monitor</html>"
+
+def test_serve_handler_serves_root():
+    import urllib.request
+    store = pi_monitor.PageStore()
+    store.replace("<html>monitor</html>")
+    httpd, thread, base = _start_handler(store, "index.html")
+    try:
+        with urllib.request.urlopen(f"{base}/", timeout=5) as resp:
+            assert resp.geturl().endswith("/"), "should be served directly, no redirect"
+            body = resp.read().decode()
+    finally:
+        _stop_handler(httpd, thread)
+    assert body == "<html>monitor</html>"
+
+def test_serve_handler_unknown_path_is_404():
+    import urllib.error
+    import urllib.request
+    store = pi_monitor.PageStore()
+    store.replace("<html>monitor</html>")
+    httpd, thread, base = _start_handler(store)
+    try:
+        try:
+            urllib.request.urlopen(f"{base}/other.html", timeout=5)
+            code = 200
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+    finally:
+        _stop_handler(httpd, thread)
+    assert code == 404
+
+def test_serve_handler_conditional_get_returns_304():
+    import urllib.error
+    import urllib.request
+    store = pi_monitor.PageStore()
+    store.replace("<html>monitor</html>")
+    httpd, thread, base = _start_handler(store)
+    try:
+        req = urllib.request.Request(f"{base}/", headers={"If-None-Match": store.snapshot()[1]})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                code, body = resp.status, resp.read()
+        except urllib.error.HTTPError as exc:  # urllib surfaces 304 as an error
+            code, body = exc.code, exc.read()
+    finally:
+        _stop_handler(httpd, thread)
+    assert code == 304
+    assert body == b""
+
+def test_serve_handler_conditional_get_returns_200_when_stale():
+    import urllib.request
+    store = pi_monitor.PageStore()
+    store.replace("<html>v1</html>")
+    httpd, thread, base = _start_handler(store)
+    try:
+        req = urllib.request.Request(f"{base}/", headers={"If-None-Match": 'W/"nope"'})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            code = resp.status
+    finally:
+        _stop_handler(httpd, thread)
+    assert code == 200
+
+def test_serve_handler_updates_atomically_between_requests():
+    import urllib.request
+    store = pi_monitor.PageStore()
+    store.replace("<html>v1</html>")
+    httpd, thread, base = _start_handler(store)
+    try:
+        with urllib.request.urlopen(f"{base}/", timeout=5) as resp:
+            assert resp.read().decode() == "<html>v1</html>"
+        store.replace("<html>v2</html>")
+        with urllib.request.urlopen(f"{base}/", timeout=5) as resp:
+            assert resp.read().decode() == "<html>v2</html>"
+    finally:
+        _stop_handler(httpd, thread)
+
+def test_serve_handler_confined_to_known_paths():
+    import socket as _socket
+    store = pi_monitor.PageStore()
+    store.replace("<html>monitor</html>")
+    httpd, thread = _start_handler(store)[:2]
+    port = httpd.server_address[1]
+    try:
+        # Raw socket so encoded traversal sequences reach the server untranslated;
+        # urllib would collapse them client-side. There is no filesystem behind
+        # this server — anything that is not "/" or the page name must be rejected.
+        sock = _socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            sock.sendall(b"GET /../pi_monitor.py HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            response = sock.recv(4096).decode("utf-8", "replace")
+            sock.sendall(b"GET /%2e%2e/secret.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            response += sock.recv(4096).decode("utf-8", "replace")
+        finally:
+            sock.close()
+    finally:
+        _stop_handler(httpd, thread)
+    assert "200" not in response.split("\n")[0]
 
 
 # ── build_html ─────────────────────────────────────────────────────────────────

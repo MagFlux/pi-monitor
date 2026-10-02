@@ -2,8 +2,12 @@
 """
 pi_monitor.py — Raspberry Pi static HTML health dashboard generator
 
-Run via cron every 5 minutes:
+One-shot: generate the page and exit (run via cron every 5 minutes):
   */5 * * * * /usr/bin/python3 /home/pi/pi_monitor.py
+
+All-in-one: hold the live page in memory, serve it and regenerate it every 5
+minutes in one command — no disk writes, the browser updates in place:
+  python3 pi_monitor.py --serve --interval 300
 
 Run with --help for options:
   python3 pi_monitor.py --help
@@ -19,6 +23,10 @@ import re
 import time
 import html
 import json
+import sys
+import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -30,6 +38,10 @@ PING_COUNT  = 4
 TAILSCALE_ENABLED = False
 TAILSCALE_CONTAINER = "tailscale"
 DOCKER_ENABLED = False
+SERVE_ENABLED = False     # serve the page with the built-in web server
+SERVE_BIND  = "0.0.0.0"   # interface to listen on ("127.0.0.1" to keep it local)
+SERVE_PORT  = 8080        # port for the built-in web server
+REFRESH_INTERVAL = 300    # seconds between page regenerations (and browser reloads)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -123,6 +135,19 @@ def bar(pct, cls="ok"):
 def status_dot(ok):
     cls = "dot-ok" if ok else "dot-crit"
     return f'<span class="dot {cls}"></span>'
+
+
+def _fmt_interval(secs):
+    """Human-readable interval, e.g. 45 → '45s', 300 → '5 min', 5400 → '1.5 hr'."""
+    secs = int(secs)
+    if secs < 60:
+        return f"{secs}s"
+    mins = secs / 60
+    if mins < 60:
+        if secs % 60 == 0:
+            return f"{int(mins)} min"
+        return f"{mins:.1f} min"
+    return f"{secs / 3600:g} hr"
 
 
 # ── Card base class ───────────────────────────────────────────────────────────
@@ -318,11 +343,24 @@ class ConnectivityCard(Card):
         self.ping_count = ping_count
 
     def collect(self):
+        # Ping and WAN-IP lookup are independent — run them concurrently so the
+        # card takes as long as the slower probe, not the sum of both.
+        wan_holder = {}
+        def _wan_worker():
+            wan_holder["ip"] = self._get_wan_ip()
+        wan_thread = threading.Thread(target=_wan_worker, daemon=True)
+        wan_thread.start()
         self.ping_ok, self.ping_loss, self.ping_avg = self._get_ping()
-        self.wan_ip = self._get_wan_ip()
+        wan_thread.join(timeout=20)
+        self.wan_ip = wan_holder.get("ip")
 
     def _get_ping(self):
-        raw = run(f"ping -c {self.ping_count} -W 2 {self.ping_host} 2>/dev/null")
+        # -i 0.2 spaces the packets faster than iputils' default 1s (0.2 is the
+        # minimum unprivileged interval). If this ping doesn't accept it, fall
+        # back to the plain form so connectivity never false-reports failure.
+        raw = run(f"ping -c {self.ping_count} -i 0.2 -W 2 {self.ping_host} 2>/dev/null")
+        if raw == "N/A":
+            raw = run(f"ping -c {self.ping_count} -W 2 {self.ping_host} 2>/dev/null")
         if raw == "N/A":
             return None, None, None
         loss_m = re.search(r"(\d+)% packet loss", raw)
@@ -756,6 +794,20 @@ def _css():
     --head:     #f9fafb;
     --shadow:   none;
   }
+  html {
+    /* Reserve the scrollbar gutter permanently so the usable page width never
+       jumps when content height changes between updates; thin scrollbar keeps
+       the reserved space small. */
+    scrollbar-gutter: stable;
+    scrollbar-width: thin;
+  }
+  @supports not (scrollbar-gutter: stable) {
+    html { overflow-y: scroll; }  /* same stability for older browsers */
+  }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     background: var(--bg);
@@ -807,7 +859,7 @@ def _css():
   .stale-note { font-size: 11px; color: var(--muted); margin-top: 2px; }
   .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
     gap: 16px;
   }
   .grid-wide { display: grid; grid-template-columns: 1fr; gap: 16px; margin-top: 16px; }
@@ -951,8 +1003,16 @@ def _css():
   strong { font-weight: 600; }"""
 
 
-def _js():
-    return """\
+def _js(refresh_secs=300):
+    """Page JS: theme toggle + in-place live updates.
+
+    Kept as a plain string with a __REFRESH_SECS__ placeholder (rather than an
+    f-string) so the JavaScript braces do not need escaping.
+    """
+    return _JS_TEMPLATE.replace("__REFRESH_SECS__", str(max(1, int(refresh_secs))))
+
+
+_JS_TEMPLATE = """\
   const btn  = document.getElementById('themeBtn');
   const root = document.documentElement;
   // localStorage overrides the server-side default if the user has toggled manually
@@ -974,43 +1034,104 @@ def _js():
       localStorage.setItem('theme', 'dark');
     }
     syncBtn();
-  }"""
+  }
 
+  // ── In-place live updates ────────────────────────────────────────────────
+  // Periodically FETCH this page, parse the response and swap the contents of
+  // the #live container — no full page reload, so scroll position, the theme
+  // toggle and any select/focus state survive updates. The <noscript> meta
+  // refresh in <head> is the fallback for browsers without JavaScript.
+  // Guard against the swap re-running init when the replaced copy's own
+  // <script> block comes along with the fragment.
+  if (!window.__piMonitorLive) {
+    window.__piMonitorLive = true;
+    (function () {
+      const INTERVAL = __REFRESH_SECS__;  // seconds; replaced by the generator
+      const liveEl  = document.getElementById('live');
+      const staleEl = document.querySelector('.stale-note');
+      const STALE_MSG = 'connection lost — retrying';
+      if (!liveEl) return;
+      let lastHtml = liveEl.innerHTML;
+      async function poll() {
+        try {
+          const res = await fetch(window.location.href, {cache: 'no-store'});
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+          const fresh = doc.getElementById('live');
+          if (!fresh) return;                                // unexpected page shape; keep old content
+          if (fresh.innerHTML !== lastHtml) {                // swap only when card data changed
+            lastHtml = fresh.innerHTML;
+            liveEl.innerHTML = lastHtml;
+            showLive();
+          }
+          // Header bits tick without touching the DOM-heavy card region
+          for (const sel of ['.datetime .date', '.datetime .time']) {
+            const f = doc.querySelector(sel), c = document.querySelector(sel);
+            if (f && c && f.textContent !== c.textContent) c.textContent = f.textContent;
+          }
+          const freshSys = doc.getElementById('sysline');
+          const curSys   = document.getElementById('sysline');
+          if (freshSys && curSys && freshSys.innerHTML !== curSys.innerHTML) {
+            curSys.innerHTML = freshSys.innerHTML;           // uptime ticks with the clock
+          }
+        } catch (err) {
+          showStale();  // keep showing the last good content, retry next cycle
+        }
+      }
+      function showStale() {
+        if (staleEl.dataset.note === undefined) {
+          staleEl.dataset.note = staleEl.textContent;  // remember the normal text
+        }
+        staleEl.textContent = STALE_MSG;
+      }
+      function showLive() {
+        if (staleEl.dataset.note !== undefined) {
+          staleEl.textContent = staleEl.dataset.note;
+          delete staleEl.dataset.note;
+        }
+      }
+      setInterval(poll, INTERVAL * 1000);
+    })();
+  }"""
 
 # ── HTML generation ───────────────────────────────────────────────────────────
 
-def build_html(cards, hostname, uptime, pretty_os, kernel, arch, date_str, time_str):
+def build_html(cards, hostname, uptime, pretty_os, kernel, arch, date_str, time_str, refresh_secs=300):
     h = html.escape
+    refresh_secs = max(1, int(refresh_secs))
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="300">
 <title>pi monitor — {h(hostname)}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
 {_css()}
 </style>
+<noscript>
+<meta http-equiv="refresh" content="{refresh_secs}">
+</noscript>
 </head>
 <body>
 
 <header class="header">
   <div>
     <div class="hostname"><span>●</span> {h(hostname)}</div>
-    <div style="margin-top:4px;font-size:12px;color:var(--muted);">up {h(uptime)} &nbsp;·&nbsp; {h(pretty_os)} &nbsp;·&nbsp; {h(kernel)} &nbsp;·&nbsp; {h(arch)}</div>
+    <div id="sysline" style="margin-top:4px;font-size:12px;color:var(--muted);">up {h(uptime)} &nbsp;·&nbsp; {h(pretty_os)} &nbsp;·&nbsp; {h(kernel)} &nbsp;·&nbsp; {h(arch)}</div>
   </div>
   <div style="display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap">
     <button class="theme-btn" onclick="toggleTheme()" id="themeBtn">☾ Dark</button>
     <div class="datetime">
       <div class="date">{date_str}</div>
       <div class="time">{time_str}</div>
-      <div class="stale-note">refreshes every 5 min</div>
+      <div class="stale-note">updates in place every {_fmt_interval(refresh_secs)}</div>
     </div>
   </div>
 </header>
 
+<div id="live">
 <div class="grid">
 {cards['cpu'].render()}
 {cards['temp'].render()}
@@ -1031,14 +1152,239 @@ def build_html(cards, hostname, uptime, pretty_os, kernel, arch, date_str, time_
 {cards['processes'].render()}
 </div>
 
-<div class="footer">generated by pi_monitor.py &nbsp;·&nbsp; {date_str} {time_str}</div>
+<div class="footer">generated by pi_monitor.py</div>
+</div>
 
 <script>
-{_js()}
+{_js(refresh_secs)}
 </script>
 
 </body>
 </html>"""
+
+
+# ── Serving ───────────────────────────────────────────────────────────────────
+
+class PageStore:
+    """Holds the current rendered page in memory and swaps it atomically.
+
+    Threads read a snapshot into a local variable first, so a concurrent
+    replace() never produces a torn response.
+    """
+
+    def __init__(self):
+        self._lock   = threading.Lock()
+        self._page   = None
+        self._etag   = None
+        self._updated = None  # last update timestamp as HH:MM:SS, for log lines
+
+    def replace(self, page, updated=None):
+        etag = 'W/"' + hashlib.sha256(page.encode("utf-8")).hexdigest()[:16] + '"'
+        with self._lock:
+            self._page, self._etag, self._updated = page, etag, updated
+
+    def snapshot(self):
+        with self._lock:
+            return self._page, self._etag
+
+    @property
+    def updated(self):
+        with self._lock:
+            return self._updated
+
+
+def _collect_and_render(make_cards, refresh_secs, store=None, output_path=None):
+    """One generation cycle: collect data, render HTML, store/serve it.
+
+    serve mode renders into the PageStore (no disk I/O). When `output_path` is
+    given (one-shot mode, or opt-in --also-write) the page is additionally
+    written to disk atomically.
+    """
+    cards = make_cards()
+
+    with ThreadPoolExecutor(max_workers=max(1, len(cards)), thread_name_prefix="pi-monitor-collect") as pool:
+        futures = [pool.submit(c.collect) for c in cards.values()]
+        for f in futures:
+            f.result()  # re-raises any collection error after all are done
+
+    hostname            = get_hostname()
+    date_str, time_str  = get_datetime()
+    uptime              = get_uptime()
+    pretty_os, kernel, arch = get_os_info()
+
+    page = build_html(cards, hostname, uptime, pretty_os, kernel, arch,
+                      date_str, time_str, refresh_secs=refresh_secs)
+    if store is not None:
+        store.replace(page, updated=time_str)
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(output_path, page)
+    return page
+
+
+def _collect_and_write(output_path, make_cards, refresh_secs=REFRESH_INTERVAL):
+    """One generation cycle that writes the page to disk (one-shot mode).
+
+    Card collection is I/O-bound and independent per card (each card writes only
+    its own state; rendering happens after every collect() finishes), so probes
+    run in parallel to keep the cycle short. Rendering is single-threaded.
+    """
+    _collect_and_render(make_cards, refresh_secs, store=None, output_path=output_path)
+
+
+def _atomic_write(output_path, page):
+    """Write `page` atomically: temp file + os.replace, never a torn read."""
+    tmp_path = output_path.with_name(output_path.name + ".tmp")
+    tmp_path.write_text(page, encoding="utf-8")
+    os.replace(tmp_path, output_path)
+
+
+def _make_handler_class(store, filename):
+    """Build a request handler that serves the page from the in-memory PageStore."""
+    from http.server import BaseHTTPRequestHandler
+    from http import HTTPStatus
+
+    class MonitorHandler(BaseHTTPRequestHandler):
+
+        def do_GET(self):
+            page, etag = store.snapshot()
+            if page is None:
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "page not rendered yet")
+                return
+            if self.path.split("?")[0] not in ("/", f"/{filename}"):
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            self.send_page(page, etag)
+
+        def do_HEAD(self):
+            page, etag = store.snapshot()
+            if page is None:
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            self.send_page(page, etag, body=False)
+
+        def send_page(self, page, etag, body=True):
+            # If-None-Match / 304: unchanged cycles cost the client almost nothing.
+            inm = self.headers.get("If-None-Match")
+            if etag and inm and etag in [t.strip() for t in inm.split(",")]:
+                self.send_response(HTTPStatus.NOT_MODIFIED)
+                self.send_header("ETag", etag)
+                self.end_headers()
+                return
+            payload = page.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-cache")  # always revalidate; 304 if unchanged
+            self.end_headers()
+            if body:
+                self.wfile.write(payload)
+
+        def version_string(self):
+            return "pi_monitor"
+
+    return MonitorHandler
+
+
+def _primary_local_ip():
+    """Best-effort LAN address for display only (no packets are sent)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except Exception:
+        return None
+
+
+def _advertised_urls(bind, port):
+    if bind in ("0.0.0.0", "::", ""):
+        urls = [f"http://localhost:{port}/"]
+        ip = _primary_local_ip()
+        if ip and ip != "127.0.0.1":
+            urls.append(f"http://{ip}:{port}/  (LAN)")
+        return urls
+    return [f"http://{bind}:{port}/"]
+
+
+def _refresh_loop(stop_event, interval, make_cards, store, refresh_secs, output_path=None):
+    """Regenerate the page every `interval` seconds until stop_event is set.
+
+    The interval is measured cycle-start to cycle-start, not added on top of
+    the (multi-second) collection work. If collection is slower than the
+    interval, cycles simply run back-to-back as fast as possible.
+    """
+    interval = float(interval)
+    slow_note_shown = False
+    dest = output_path if output_path is not None else "the live page"
+    while not stop_event.is_set():
+        start = time.monotonic()
+        ts = datetime.now().strftime("%H:%M:%S")
+        try:
+            _collect_and_render(make_cards, refresh_secs, store=store, output_path=output_path)
+            print(f"[pi_monitor] {ts} Refreshed {dest}")
+        except Exception as exc:  # keep serving even if a refresh fails
+            print(f"[pi_monitor] {ts} Refresh failed: {exc}", file=sys.stderr)
+        duration = time.monotonic() - start
+        if not slow_note_shown and duration > interval:
+            print(f"[pi_monitor] note: data collection takes ~{duration:.1f}s, longer than "
+                  f"--interval {interval:g}s — refreshing as fast as possible")
+            slow_note_shown = True
+        # Sleep only the remainder of the interval, measured from cycle start
+        stop_event.wait(timeout=_next_wake(start, interval))
+
+
+def _next_wake(start_monotonic, interval):
+    """Seconds left to sleep so the next cycle starts `interval` after the last one began. 0 → immediately."""
+    return max(0.0, start_monotonic + float(interval) - time.monotonic())
+
+
+def _serve(output_path, make_cards, bind, port, interval, also_write_path=None):
+    """Serve the dashboard from memory and regenerate it every `interval` seconds (blocks).
+
+    No disk writes happen unless `also_write_path` is set (opt-in mirror of the
+    page for other tooling); the rendered page lives in a PageStore and the
+    server hands it straight to clients, so --interval 1 means zero SD-card wear.
+    """
+    from http.server import ThreadingHTTPServer
+
+    store = PageStore()
+
+    # First page must be rendered before the server starts, so the bare URL works immediately.
+    print("[pi_monitor] Collecting system stats for the first page...")
+    _collect_and_render(make_cards, interval, store=store, output_path=also_write_path)
+
+    handler_cls = _make_handler_class(store, output_path.name)
+    httpd       = ThreadingHTTPServer((bind, port), handler_cls)
+
+    stop     = threading.Event()
+    refresher = threading.Thread(
+        target=_refresh_loop,
+        args=(stop, interval, make_cards, store, interval),
+        kwargs={"output_path": also_write_path},
+        daemon=True,
+        name="pi-monitor-refresher",
+    )
+    refresher.start()
+
+    print("[pi_monitor] Serving the live page from memory at:")
+    for url in _advertised_urls(bind, port):
+        print(f"  {url}")
+    if also_write_path:
+        print(f"[pi_monitor] Mirroring each update to {also_write_path}")
+    print(f"[pi_monitor] Regenerating the page every {_fmt_interval(interval)} — press Ctrl+C to stop")
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[pi_monitor] Shutting down")
+    finally:
+        stop.set()
+        httpd.server_close()
+        refresher.join(timeout=5)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -1047,7 +1393,8 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Generate a static HTML monitoring page for this Raspberry Pi."
+        description="Generate a static HTML monitoring page for this Raspberry Pi. "
+                    "Use --serve to also run a built-in web server that regenerates the page periodically."
     )
     parser.add_argument("--output", "-o", metavar="PATH", default=None,
                         help=f"Where to write the HTML file (default: {OUTPUT_PATH})")
@@ -1061,6 +1408,16 @@ def main():
                         help=f"Docker container name for Tailscale (default: {TAILSCALE_CONTAINER})")
     parser.add_argument("--docker", action="store_true", default=DOCKER_ENABLED,
                         help="Include a Docker container status panel (default: off). Requires the running user to be in the docker group.")
+    parser.add_argument("--serve", action="store_true", default=SERVE_ENABLED,
+                        help="Serve the page with Python's built-in web server and regenerate it every --interval seconds (default: off). The rendered page is held in memory — no disk writes. Blocks until Ctrl+C.")
+    parser.add_argument("--also-write", metavar="PATH", default=None,
+                        help="With --serve: additionally mirror every update to this file (e.g. for another static server on the same box). Leave off to avoid SD-card writes.")
+    parser.add_argument("--interval", metavar="SECONDS", type=int, default=REFRESH_INTERVAL,
+                        help=f"Seconds between page regenerations when serving; the browser reloads at the same rate (default: {REFRESH_INTERVAL})")
+    parser.add_argument("--port", "-p", metavar="PORT", type=int, default=SERVE_PORT,
+                        help=f"Port for the built-in web server, requires --serve (default: {SERVE_PORT})")
+    parser.add_argument("--bind", metavar="ADDRESS", default=SERVE_BIND,
+                        help=f"Interface to bind the web server to; '0.0.0.0' serves the LAN (default: {SERVE_BIND})")
 
     args = parser.parse_args()
 
@@ -1069,31 +1426,36 @@ def main():
     ping_count  = args.ping_count or PING_COUNT
     ts_container = args.tailscale_container or TAILSCALE_CONTAINER
 
-    cards = {
-        "cpu":          CpuCard(),
-        "temp":         TemperatureCard(),
-        "memory":       MemoryCard(),
-        "connectivity": ConnectivityCard(ping_host=ping_host, ping_count=ping_count),
-        "wifi":         WifiCard(),
-        "eth":          EthernetCard(),
-        "tailscale":    TailscaleCard(enabled=args.tailscale, container=ts_container),
-        "docker":       DockerCard(enabled=args.docker),
-        "disks":        DiskCard(),
-        "ports":        PortsCard(),
-        "processes":    ProcessesCard(),
-    }
+    def make_cards():
+        return {
+            "cpu":          CpuCard(),
+            "temp":         TemperatureCard(),
+            "memory":       MemoryCard(),
+            "connectivity": ConnectivityCard(ping_host=ping_host, ping_count=ping_count),
+            "wifi":         WifiCard(),
+            "eth":          EthernetCard(),
+            "tailscale":    TailscaleCard(enabled=args.tailscale, container=ts_container),
+            "docker":       DockerCard(enabled=args.docker),
+            "disks":        DiskCard(),
+            "ports":        PortsCard(),
+            "processes":    ProcessesCard(),
+        }
 
-    for c in cards.values():
-        c.collect()
+    if args.serve:
+        if args.interval < 1:
+            parser.error("--interval must be at least 1 second")
+        if args.port < 1 or args.port > 65535:
+            parser.error("--port must be between 1 and 65535")
+        mirror_path = Path(args.also_write) if args.also_write else None
+        try:
+            _serve(output_path, make_cards, args.bind, args.port, args.interval,
+                   also_write_path=mirror_path)
+        except OSError as exc:  # e.g. port already in use, permission denied
+            print(f"[pi_monitor] Server error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
 
-    hostname            = get_hostname()
-    date_str, time_str  = get_datetime()
-    uptime              = get_uptime()
-    pretty_os, kernel, arch = get_os_info()
-
-    page = build_html(cards, hostname, uptime, pretty_os, kernel, arch, date_str, time_str)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(page, encoding="utf-8")
+    _collect_and_write(output_path, make_cards, args.interval)
     print(f"[pi_monitor] Written to {output_path}")
 
 if __name__ == "__main__":

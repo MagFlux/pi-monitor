@@ -6,7 +6,7 @@ PORT = 8080
 help:
 	@echo "Usage: make <target>"
 	@echo ""
-	@echo "  serve            Generate the dashboard and serve it on http://localhost:$(PORT)"
+	@echo "  serve            Serve the live dashboard at http://localhost:$(PORT) (in-memory, auto-regenerates)"
 	@echo "  clean            Remove the $(OUTPUT_DIR)/ output directory"
 	@echo "  test             Run all tests (unit + integration)"
 	@echo "  test-unit        Run unit tests only"
@@ -15,10 +15,7 @@ help:
 	@echo "  help             Show this help message"
 
 serve:
-	mkdir -p $(OUTPUT_DIR)
-	python3 pi_monitor.py --output $(OUTPUT_DIR)/index.html
-	@echo "Serving at http://localhost:$(PORT)"
-	python3 -m http.server $(PORT) --bind 0.0.0.0 --directory $(OUTPUT_DIR)
+	python3 pi_monitor.py --serve --port $(PORT)
 
 clean:
 	rm -rf $(OUTPUT_DIR)
